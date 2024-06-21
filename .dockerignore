@@ -4,6 +4,7 @@
 
 # Cog
 /checkpoints/
+/safety-cache/
 *.png
 *.webp
 *.jpg
