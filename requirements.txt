@@ -1,0 +1,14 @@
+git+https://github.com/instantX-research/diffusers_sd3_control.git@sd3_control
+torch
+torchvision
+invisible_watermark
+transformers
+accelerate
+safetensors
+sentencepiece
+peft
+opencv-python
+spaces
+bitsandbytes
+numpy<2.0.0
+protobuf
