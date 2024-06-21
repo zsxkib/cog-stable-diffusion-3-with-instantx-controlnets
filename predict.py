@@ -88,7 +88,6 @@ def download_weights(url: str, dest: str) -> None:
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
-
         if not os.path.exists(MODEL_CACHE):
             os.makedirs(MODEL_CACHE)
 
@@ -98,10 +97,8 @@ class Predictor(BasePredictor):
             "models--InstantX--SD3-Controlnet-Tile.tar",
             "models--stabilityai--stable-diffusion-3-medium-diffusers.tar",
         ]
-
         for model_file in model_files:
             url = BASE_URL + model_file
-
             filename = url.split("/")[-1]
             dest_path = os.path.join(MODEL_CACHE, filename)
             if not os.path.exists(dest_path.replace(".tar", "")):
@@ -153,11 +150,7 @@ class Predictor(BasePredictor):
         ),
         structure: str = Input(
             description="Structure type",
-            choices=[
-                "canny",
-                "pose",
-                "tile",
-            ],
+            choices=["canny", "pose", "tile"],
             default="canny",
         ),
         aspect_ratio: str = Input(
@@ -166,10 +159,7 @@ class Predictor(BasePredictor):
             default="1:1",
         ),
         num_outputs: int = Input(
-            description="Number of images to output.",
-            ge=1,
-            le=4,
-            default=1,
+            description="Number of images to output.", ge=1, le=4, default=1
         ),
         inference_steps: int = Input(
             description="Inference steps", ge=1, le=50, default=25
@@ -179,6 +169,18 @@ class Predictor(BasePredictor):
         ),
         control_weight: float = Input(
             description="Control weight", ge=0.0, le=1.0, default=0.7
+        ),
+        low_threshold: int = Input(
+            description="[Canny only] Line detection low threshold",
+            ge=1,
+            le=255,
+            default=100,
+        ),
+        high_threshold: int = Input(
+            description="[Canny only] Line detection high threshold",
+            ge=1,
+            le=255,
+            default=200,
         ),
         seed: int = Input(
             description="Random seed. Leave blank to randomize the seed", default=None
@@ -203,56 +205,39 @@ class Predictor(BasePredictor):
         image_in = input_image
         n_prompt = negative_prompt
 
+        # Set seed
         if seed is None:
             seed = int.from_bytes(os.urandom(2), "big")
-        elif seed != self.previous_seed:
+        if seed != self.previous_seed:
             self.generator.manual_seed(seed)
             self.previous_seed = seed
-
         print(f"Using seed: {seed}")
 
-        # Preprocess the input image
+        # Preprocess input image
         input_image = Image.open(str(image_in))
-        if input_image.mode != "RGB":
-            input_image = input_image.convert("RGB")
+        input_image = input_image.convert("RGB")  # Always convert to RGB
 
-        # Load the required model based on the selected structure
+        # Prepare control image
         if structure == "canny":
-            controlnet = SD3ControlNetModel.from_pretrained(
-                "InstantX/SD3-Controlnet-Canny",
-                cache_dir=MODEL_CACHE,
-                force_download=False,
-                local_files_only=True,
-            )
-            # Canny preprocessing
-            image_to_canny = np.array(input_image)
-            image_to_canny = cv2.Canny(image_to_canny, 100, 200)
-            image_to_canny = image_to_canny[:, :, None]
-            image_to_canny = np.concatenate(
-                [image_to_canny, image_to_canny, image_to_canny], axis=2
-            )
-            control_image = Image.fromarray(image_to_canny)
-        elif structure == "pose":
-            controlnet = SD3ControlNetModel.from_pretrained(
-                "InstantX/SD3-Controlnet-Pose",
-                cache_dir=MODEL_CACHE,
-                force_download=False,
-                local_files_only=True,
-            )
-            # Pose preprocessing (assuming the input image is already a pose image)
-            control_image = input_image
-        elif structure == "tile":
-            controlnet = SD3ControlNetModel.from_pretrained(
-                "InstantX/SD3-Controlnet-Tile",
-                cache_dir=MODEL_CACHE,
-                force_download=False,
-                local_files_only=True,
-            )
-            # Tile preprocessing (assuming the input image is already a tile image)
+            image_array = np.array(input_image)
+            edges = cv2.Canny(image_array, low_threshold, high_threshold)
+            edges_rgb = np.stack([edges] * 3, axis=-1)
+            control_image = Image.fromarray(edges_rgb)
+        elif structure in ["pose", "tile"]:
             control_image = input_image
         else:
             raise ValueError(f"Unsupported structure: {structure}")
 
+        # Load pipeline
+        # The model naming convention follows the pattern:
+        # InstantX/SD3-Controlnet-{Structure} where Structure is Tile, Pose, or Canny
+        # This corresponds to the input structure types (capitalized)
+        controlnet = SD3ControlNetModel.from_pretrained(
+            f"InstantX/SD3-Controlnet-{structure.capitalize()}",
+            cache_dir=MODEL_CACHE,
+            force_download=False,
+            local_files_only=True,
+        )
         pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
             "stabilityai/stable-diffusion-3-medium-diffusers",
             controlnet=controlnet,
@@ -261,10 +246,8 @@ class Predictor(BasePredictor):
             local_files_only=True,
         ).to(DEVICE, DTYPE)
 
-        # Get width and height from aspect ratio
+        # Generate images
         width, height = self.aspect_ratio_to_width_height(aspect_ratio)
-
-        # infer
         images = pipe(
             prompt=[prompt] * num_outputs,
             negative_prompt=[n_prompt] * num_outputs,
@@ -277,26 +260,27 @@ class Predictor(BasePredictor):
             height=height,
         ).images
 
+        # Run safety checker
         if not disable_safety_checker:
             has_nsfw_content = self.run_safety_checker(images)
         else:
             has_nsfw_content = [False] * len(images)
 
+        # Process and save images
         output_paths = []
         for i, image in enumerate(images):
             if has_nsfw_content[i]:
                 print(f"NSFW content detected in image {i}. Skipping...")
                 continue
 
-            image_redim, w, h = resize_image(
-                str(image_in), f"resized_input_{i}.jpg", 1024
-            )
-            image = image.resize((w, h), Image.LANCZOS)
+            # Resize image using the in-memory input_image
+            resized_input, w, h = resize_image(input_image, 1024)
+            resized_image = image.resize((w, h), Image.LANCZOS)
 
-            # Save the image with the specified format and quality
-            image = image.convert("RGB")
-            extension = output_format.lower()
-            extension = "jpeg" if extension == "jpg" else extension
+            # Save image
+            extension = (
+                "jpeg" if output_format.lower() == "jpg" else output_format.lower()
+            )
             output_path = f"output_{i}.{extension}"
 
             print(f"[~] Saving to {output_path}...")
@@ -309,7 +293,7 @@ class Predictor(BasePredictor):
                 save_params["quality"] = output_quality
                 save_params["optimize"] = True
 
-            image.save(output_path, **save_params)
+            resized_image.convert("RGB").save(output_path, **save_params)
             output_paths.append(Path(output_path))
 
         if len(output_paths) == 0:
