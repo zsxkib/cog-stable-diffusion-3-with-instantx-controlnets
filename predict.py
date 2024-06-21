@@ -115,6 +115,9 @@ class Predictor(BasePredictor):
         ).to("cuda")
         self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
 
+        self.previous_structure = None
+        self.pipe = None
+
     def aspect_ratio_to_width_height(self, aspect_ratio: str):
         aspect_ratios = {
             "1:1": (1024, 1024),
@@ -216,6 +219,8 @@ class Predictor(BasePredictor):
         # Preprocess input image
         input_image = Image.open(str(image_in))
         input_image = input_image.convert("RGB")  # Always convert to RGB
+        temp_rgb_path = "temp_rgb_input.jpg"
+        input_image.save(temp_rgb_path)
 
         # Prepare control image
         if structure == "canny":
@@ -228,27 +233,29 @@ class Predictor(BasePredictor):
         else:
             raise ValueError(f"Unsupported structure: {structure}")
 
-        # Load pipeline
-        # The model naming convention follows the pattern:
-        # InstantX/SD3-Controlnet-{Structure} where Structure is Tile, Pose, or Canny
-        # This corresponds to the input structure types (capitalized)
-        controlnet = SD3ControlNetModel.from_pretrained(
-            f"InstantX/SD3-Controlnet-{structure.capitalize()}",
-            cache_dir=MODEL_CACHE,
-            force_download=False,
-            local_files_only=True,
-        )
-        pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-3-medium-diffusers",
-            controlnet=controlnet,
-            cache_dir=MODEL_CACHE,
-            force_download=False,
-            local_files_only=True,
-        ).to(DEVICE, DTYPE)
+        # Lazy load pipeline
+        if self.pipe is None or structure != self.previous_structure:
+            print(f"Loading pipeline for structure: {structure}")
+            controlnet = SD3ControlNetModel.from_pretrained(
+                f"InstantX/SD3-Controlnet-{structure.capitalize()}",
+                cache_dir=MODEL_CACHE,
+                force_download=False,
+                local_files_only=True,
+            )
+            self.pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
+                "stabilityai/stable-diffusion-3-medium-diffusers",
+                controlnet=controlnet,
+                cache_dir=MODEL_CACHE,
+                force_download=False,
+                local_files_only=True,
+            ).to(DEVICE, DTYPE)
+            self.previous_structure = structure
+        else:
+            print(f"Reusing existing pipeline for structure: {structure}")
 
         # Generate images
         width, height = self.aspect_ratio_to_width_height(aspect_ratio)
-        images = pipe(
+        images = self.pipe(
             prompt=[prompt] * num_outputs,
             negative_prompt=[n_prompt] * num_outputs,
             control_image=control_image,
@@ -273,8 +280,8 @@ class Predictor(BasePredictor):
                 print(f"NSFW content detected in image {i}. Skipping...")
                 continue
 
-            # Resize image using the in-memory input_image
-            resized_input, w, h = resize_image(input_image, 1024)
+            # Resize image using the temporary RGB file
+            _, w, h = resize_image(temp_rgb_path, f"resized_input_{i}.jpg", 1024)
             resized_image = image.resize((w, h), Image.LANCZOS)
 
             # Save image
@@ -295,6 +302,9 @@ class Predictor(BasePredictor):
 
             resized_image.convert("RGB").save(output_path, **save_params)
             output_paths.append(Path(output_path))
+
+        # Clean up the temporary file
+        os.remove(temp_rgb_path)
 
         if len(output_paths) == 0:
             raise Exception(
