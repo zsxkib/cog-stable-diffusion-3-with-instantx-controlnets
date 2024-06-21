@@ -3,6 +3,7 @@
 
 import os
 import time
+from typing import List
 import cv2
 import torch
 import mimetypes
@@ -25,6 +26,11 @@ os.environ["HF_DATASETS_CACHE"] = MODEL_CACHE
 os.environ["TRANSFORMERS_CACHE"] = MODEL_CACHE
 os.environ["HUGGINGFACE_HUB_CACHE"] = MODEL_CACHE
 
+SD3_MODEL_CACHE = "./sd3-cache"
+SAFETY_CACHE = "./safety-cache"
+FEATURE_EXTRACTOR = "./feature-extractor"
+SD3_URL = "https://weights.replicate.delivery/default/sd3/sd3-fp16.tar"
+SAFETY_URL = "https://weights.replicate.delivery/default/sdxl/safety-1.0.tar"
 BASE_URL = f"https://weights.replicate.delivery/default/sd3-controlnet/{MODEL_CACHE}/"
 
 DEVICE = (
@@ -100,7 +106,22 @@ class Predictor(BasePredictor):
 
         self.previous_seed = None
         self.generator = torch.Generator(device=DEVICE)
+    
+    def aspect_ratio_to_width_height(self, aspect_ratio: str):
+        aspect_ratios = {
+            "1:1": (1024, 1024),
+            "16:9": (1344, 768),
+            "21:9": (1536, 640),
+            "3:2": (1216, 832),
+            "2:3": (832, 1216),
+            "4:5": (896, 1088),
+            "5:4": (1088, 896),
+            "9:16": (768, 1344),
+            "9:21": (640, 1536),
+        }
+        return aspect_ratios.get(aspect_ratio)
 
+    @torch.inference_mode()
     def predict(
         self,
         input_image: Path = Input(description="Input image"),
@@ -117,11 +138,22 @@ class Predictor(BasePredictor):
             ],
             default="canny",
         ),
+        aspect_ratio: str = Input(
+            description="Aspect ratio for the generated image",
+            choices=["1:1", "16:9", "21:9", "2:3", "3:2", "4:5", "5:4", "9:16", "9:21"],
+            default="1:1",
+        ),
+        num_outputs: int = Input(
+            description="Number of images to output.",
+            ge=1,
+            le=4,
+            default=1,
+        ),
         inference_steps: int = Input(
             description="Inference steps", ge=1, le=50, default=25
         ),
         guidance_scale: float = Input(
-            description="Guidance scale", ge=1.0, le=10.0, default=7.0
+            description="Guidance scale", ge=0, le=50, default=7.0
         ),
         control_weight: float = Input(
             description="Control weight", ge=0.0, le=1.0, default=0.7
@@ -140,7 +172,11 @@ class Predictor(BasePredictor):
             ge=0,
             le=100,
         ),
-    ) -> Path:
+        disable_safety_checker: bool = Input(
+            description="Disable safety checker for generated images. This feature is only available through the API. See [https://replicate.com/docs/how-does-replicate-work#safety](https://replicate.com/docs/how-does-replicate-work#safety)",
+            default=False,
+        ),
+    ) -> List[Path]:
         """Run a single prediction on the model"""
         image_in = input_image
         n_prompt = negative_prompt
@@ -203,37 +239,50 @@ class Predictor(BasePredictor):
             local_files_only=True,
         ).to(DEVICE, DTYPE)
 
+        # Get width and height from aspect ratio
+        width, height = self.aspect_ratio_to_width_height(aspect_ratio)
+
         # infer
-        image = pipe(
-            prompt=prompt,
-            negative_prompt=n_prompt,
+        images = pipe(
+            prompt=[prompt] * num_outputs,
+            negative_prompt=[n_prompt] * num_outputs,
             control_image=control_image,
             controlnet_conditioning_scale=control_weight,
             num_inference_steps=inference_steps,
             guidance_scale=guidance_scale,
-            num_images_per_prompt=1,
             generator=self.generator,
-        ).images[0]
+            width=width,
+            height=height,
+        ).images
 
-        image_redim, w, h = resize_image(str(image_in), "resized_input.jpg", 1024)
-        image = image.resize((w, h), Image.LANCZOS)
+        output_paths = []
+        for i, image in enumerate(images):
+            if not disable_safety_checker:
+                # Implement safety checker here if needed
+                pass
 
-        # Save the image with the specified format and quality
-        image = image.convert("RGB")
-        extension = output_format.lower()
-        extension = "jpeg" if extension == "jpg" else extension
-        output_path = f"output.{extension}"
+            image_redim, w, h = resize_image(str(image_in), f"resized_input_{i}.jpg", 1024)
+            image = image.resize((w, h), Image.LANCZOS)
 
-        print(f"[~] Saving to {output_path}...")
-        print(f"[~] Output format: {extension.upper()}")
-        if output_format != "png":
-            print(f"[~] Output quality: {output_quality}")
+            # Save the image with the specified format and quality
+            image = image.convert("RGB")
+            extension = output_format.lower()
+            extension = "jpeg" if extension == "jpg" else extension
+            output_path = f"output_{i}.{extension}"
 
-        save_params = {"format": extension.upper()}
-        if output_format != "png":
-            save_params["quality"] = output_quality
-            save_params["optimize"] = True
+            print(f"[~] Saving to {output_path}...")
+            print(f"[~] Output format: {extension.upper()}")
+            if output_format != "png":
+                print(f"[~] Output quality: {output_quality}")
 
-        image.save(output_path, **save_params)
+            save_params = {"format": extension.upper()}
+            if output_format != "png":
+                save_params["quality"] = output_quality
+                save_params["optimize"] = True
 
-        return Path(output_path)
+            image.save(output_path, **save_params)
+            output_paths.append(Path(output_path))
+
+        return output_paths
+
+
