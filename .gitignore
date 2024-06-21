@@ -2,6 +2,7 @@
 .cog
 .github/
 /checkpoints/
+/safety-cache/
 *.png
 *.webp
 *.jpg
