@@ -10,10 +10,13 @@ import mimetypes
 import subprocess
 import numpy as np
 from PIL import Image
-from diffusers.utils import load_image
 from cog import BasePredictor, Input, Path
 from diffusers.models import SD3ControlNetModel
 from diffusers import StableDiffusion3ControlNetPipeline
+from diffusers.pipelines.stable_diffusion.safety_checker import (
+    StableDiffusionSafetyChecker,
+)
+from transformers import CLIPImageProcessor
 
 mimetypes.add_type("image/webp", ".webp")
 
@@ -106,7 +109,15 @@ class Predictor(BasePredictor):
 
         self.previous_seed = None
         self.generator = torch.Generator(device=DEVICE)
-    
+
+        print("Loading safety checker...")
+        if not os.path.exists(SAFETY_CACHE):
+            download_weights(SAFETY_URL, SAFETY_CACHE)
+        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
+            SAFETY_CACHE, torch_dtype=torch.float16
+        ).to("cuda")
+        self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
+
     def aspect_ratio_to_width_height(self, aspect_ratio: str):
         aspect_ratios = {
             "1:1": (1024, 1024),
@@ -120,6 +131,17 @@ class Predictor(BasePredictor):
             "9:21": (640, 1536),
         }
         return aspect_ratios.get(aspect_ratio)
+
+    def run_safety_checker(self, images):
+        safety_checker_input = self.feature_extractor(images, return_tensors="pt").to(
+            DEVICE
+        )
+        np_images = [np.array(val) for val in images]
+        _, has_nsfw_content = self.safety_checker(
+            images=np_images,
+            clip_input=safety_checker_input.pixel_values.to(torch.float16),
+        )
+        return has_nsfw_content
 
     @torch.inference_mode()
     def predict(
@@ -139,7 +161,7 @@ class Predictor(BasePredictor):
             default="canny",
         ),
         aspect_ratio: str = Input(
-            description="Aspect ratio for the generated image",
+            description="Aspect ratio for the generated image. Note that the model performs best at 1024x1024 resolution. Other sizes may yield suboptimal results.",
             choices=["1:1", "16:9", "21:9", "2:3", "3:2", "4:5", "5:4", "9:16", "9:21"],
             default="1:1",
         ),
@@ -255,13 +277,20 @@ class Predictor(BasePredictor):
             height=height,
         ).images
 
+        if not disable_safety_checker:
+            has_nsfw_content = self.run_safety_checker(images)
+        else:
+            has_nsfw_content = [False] * len(images)
+
         output_paths = []
         for i, image in enumerate(images):
-            if not disable_safety_checker:
-                # Implement safety checker here if needed
-                pass
+            if has_nsfw_content[i]:
+                print(f"NSFW content detected in image {i}. Skipping...")
+                continue
 
-            image_redim, w, h = resize_image(str(image_in), f"resized_input_{i}.jpg", 1024)
+            image_redim, w, h = resize_image(
+                str(image_in), f"resized_input_{i}.jpg", 1024
+            )
             image = image.resize((w, h), Image.LANCZOS)
 
             # Save the image with the specified format and quality
@@ -283,6 +312,9 @@ class Predictor(BasePredictor):
             image.save(output_path, **save_params)
             output_paths.append(Path(output_path))
 
+        if len(output_paths) == 0:
+            raise Exception(
+                "NSFW content detected in all generated images. Try running it again, or try a different prompt."
+            )
+
         return output_paths
-
-
